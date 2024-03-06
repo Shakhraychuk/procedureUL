@@ -1,0 +1,1211 @@
+create or replace PACKAGE BODY CUBE_OSAGO_UL_PROCESSING AS
+
+   PROCEDURE sp_osago_ul_prepare(p_res OUT integer, p_msg OUT varchar2)
+    IS
+    BEGIN
+        p_msg := 'Подготовка структуры: ';
+            BEGIN
+                EXECUTE IMMEDIATE 'DROP TABLE CUBE_OSAGO_UL_INS';
+            EXCEPTION
+                WHEN OTHERS THEN
+                    IF SQLCODE != -942 THEN
+                        RAISE;
+                    END IF;
+            END;
+                    
+            p_res := 0;
+            BEGIN
+                -- копируем структуру текущей таблицы данных куба    
+                EXECUTE IMMEDIATE 'CREATE TABLE CUBE_OSAGO_UL_INS AS SELECT * FROM CUBE_OSAGO_UL_DATA WHERE 1=0';
+                
+                -- если нам для урощения расчетов нужны колонки добавляем их здесь
+    --            EXECUTE IMMEDIATE 'ALTER TABLE CUBE_KASKO_INS ADD MDM_ID number';
+            EXCEPTION
+                WHEN OTHERS THEN
+                    p_res := -1;
+                    p_msg := p_msg || 'Ошибка создания буферной таблицы';
+                    RAISE;
+            END;
+            
+            IF p_res = 0 THEN
+                p_msg := p_msg || 'OK';
+            END IF;
+    
+        RETURN;
+    END sp_osago_ul_prepare;
+    
+    PROCEDURE sp_osago_ul_update(p_res OUT integer, p_msg OUT varchar2)
+    IS
+        v_now date;
+        v_prod integer;        
+        v_rec_count integer;
+    BEGIN
+        v_now := SYSDATE;
+        p_msg := 'Обновление куба: ';
+        p_res := 0;
+        
+        
+        DELETE FROM CUBE_OSAGO_UL_DATA dst WHERE dst.CALCULATION_DATE >= (SELECT MIN(i.CALCULATION_DATE) FROM CUBE_OSAGO_UL_INS i);
+        
+        INSERT ALL INTO CUBE_OSAGO_UL_DATA
+        SELECT * FROM CUBE_OSAGO_UL_INS;
+        COMMIT;
+   
+        UPDATE CUBE_OSAGO_UL_DATA
+        SET 
+            IS_LAST_CALL = NULL,
+            REQUEST_UNIQUE_ID = NULL;
+--            POLICY_STATUS = NULL,
+--            POLICY_NUMBER = NULL,
+--            POLICY_SERIAL = NULL,
+--            FOUND_CONTRACT_ID = NULL,
+--            SALE_POL_NOT_ANUL = NULL,
+--            SALE_POL_W_ANUL = NULL,
+--            SALE_POL_NOT_ANUL_NRP = NULL;
+        
+        
+        MERGE INTO /* +PARALLEL(CUBE_OSAGO_UL_DATA) */ CUBE_OSAGO_UL_DATA DST
+        USING
+        (
+        SELECT REQUEST_UNIQUE_HASH, ROW_NUMBER()OVER(ORDER BY REQUEST_UNIQUE_HASH) RN FROM
+        (
+        SELECT REQUEST_UNIQUE_HASH FROM CUBE_OSAGO_UL_DATA WHERE REQUEST_UNIQUE_HASH IS NOT NULL  GROUP BY REQUEST_UNIQUE_HASH
+        )
+        ) SRC
+        ON (SRC.REQUEST_UNIQUE_HASH = DST.REQUEST_UNIQUE_HASH)
+        WHEN MATCHED THEN UPDATE
+        SET
+            REQUEST_UNIQUE_ID = SRC.RN
+        WHERE 
+             REQUEST_UNIQUE_HASH IS NOT NULL;
+        
+        
+        
+        MERGE INTO /* +PARALLEL(CUBE_OSAGO_UL_DATA) */  CUBE_OSAGO_UL_DATA dst
+                 USING(
+                        SELECT run_id, prod_id
+                        FROM
+                        (
+                        SELECT
+                            lc.run_id,
+                            lc.prod_id,
+                            LAG(lc.CALCULATION_DATE) OVER(PARTITION BY lc.request_unique_id ORDER BY lc.CALCULATION_DATE desc, lc.RUN_ID DESC) lag_calcdate
+                        FROM
+                            CUBE_OSAGO_UL_DATA lc LEFT JOIN
+                            CUBE_OSAGO_UL_DATA lc_n3 ON  lc_n3.request_unique_id = lc.request_unique_id and lc_n3.call_number = 3 and lc_n3.CALCULATION_DATE > lc.CALCULATION_DATE LEFT JOIN
+                            CUBE_OSAGO_UL_DATA lc_p3 ON  lc_p3.request_unique_id = lc.request_unique_id and lc_p3.call_number = 3 AND lc_p3.CALCULATION_DATE < lc.CALCULATION_DATE 
+                        WHERE
+                            lc_n3.request_unique_id IS NULL AND
+                            (lc_p3.request_unique_id IS NULL OR lc.call_number = 3)
+                        ) lc
+                        WHERE
+                            lc.lag_calcdate IS NULL
+                        ) src ON (src.run_id = dst.run_id and src.prod_id = dst.prod_id)
+                 WHEN MATCHED THEN UPDATE SET IS_LAST_CALL = 1
+        ;
+        
+        
+        --merge into /* +PARALLEL(CUBE_OSAGO_UL_DATA) */ CUBE_OSAGO_UL_DATA dst
+        --using
+        --(select upper(contract_ID) contract_ID, NUMBAR, SERIAL from ETL_POLICYREGISTRY_WA where trunc(applicationdate) < TRUNC(SYSDATE)  and  upper(documentstatusid) = '0C9468DD-F53C-4962-8B0B-93BF28ABA6A9') src
+        --on
+        --(upper(dst.contract_id) = src.contract_ID AND dst.IS_LAST_CALL = 1)
+        --WHEN MATCHED THEN update  set 
+        --POLICY_status ='ДЕЙСТВУЮЩИЙ',
+        --POLICY_NUMBER = src.NUMBAR,
+        --POLICY_SERIAL = src.SERIAL,
+        --found_contract_id = src.contract_ID
+        --;
+        
+        --merge into /* +PARALLEL(CUBE_OSAGO_UL_DATA) */ CUBE_OSAGO_UL_DATA dst
+        --using
+        --(select upper(contract_ID) contract_ID, NUMBAR, SERIAL from ETL_POLICYREGISTRY_WA where trunc(applicationdate) < TRUNC(SYSDATE) and  upper(documentstatusid) = 'FFE17B47-6238-4DFD-B3ED-FCA4104A39EE') src
+        --on
+        --(upper(dst.contract_id) = src.contract_ID AND dst.IS_LAST_CALL = 1)
+        --WHEN MATCHED THEN update  set 
+        --POLICY_status ='АННУЛИРОВАННЫЙ',
+        --POLICY_NUMBER = src.NUMBAR,
+        --POLICY_SERIAL = src.SERIAL,
+        --found_contract_id = src.contract_ID;
+        
+        
+        MERGE INTO /* +PARALLEL(cube_osago_ul_data) */ cube_osago_ul_data dst
+        USING
+        (
+        select AGENT_DOC_NUMBER, ROW_NUMBER()OVER(ORDER BY AGENT_DOC_NUMBER) rn FROM
+        (
+        SELECT AGENT_DOC_NUMBER FROM cube_osago_ul_data GROUP bY AGENT_DOC_NUMBER
+        )
+        ) src
+        ON (src.AGENT_DOC_NUMBER = dst.AGENT_DOC_NUMBER)
+        WHEN MATCHED THEN UPDATE
+        SET
+            AGENT_N = src.RN;
+        
+        
+         MERGE INTO /* +PARALLEL(cube_osago_ul_data) */ cube_osago_ul_data dst
+        USING
+        (
+        select ins_inn_hash, ROW_NUMBER()OVER(ORDER BY ins_inn_hash) rn FROM
+        (
+        SELECT ins_inn_hash FROM cube_osago_ul_data GROUP bY ins_inn_hash
+        )
+        ) src
+        ON (src.ins_inn_hash = dst.ins_inn_hash)
+        WHEN MATCHED THEN UPDATE
+        SET
+            ins_inn_n = src.RN;
+        
+        
+        MERGE INTO /* +PARALLEL(cube_osago_ul_data) */ cube_osago_ul_data dst
+        USING
+        (
+        select own_inn_hash, ROW_NUMBER()OVER(ORDER BY own_inn_hash) rn FROM
+        (
+        SELECT own_inn_hash FROM cube_osago_ul_data GROUP bY own_inn_hash
+        )
+        ) src
+        ON (src.own_inn_hash = dst.own_inn_hash)
+        WHEN MATCHED THEN UPDATE
+        SET
+            own_inn_n = src.RN;
+        
+        
+        MERGE INTO /* +PARALLEL(cube_osago_ul_data) */ cube_osago_ul_data dst
+        USING
+        (
+        select VEH_HASH, ROW_NUMBER()OVER(ORDER BY VEH_HASH) rn FROM
+        (
+        SELECT VEH_HASH FROM cube_osago_ul_data  GROUP bY VEH_HASH
+        )
+        ) src
+        ON (src.VEH_HASH = dst.VEH_HASH)
+        WHEN MATCHED THEN UPDATE
+        SET
+            VEH_N = src.RN;
+            
+         MERGE INTO /* +PARALLEL(CUBE_OSAGO_UL_DATA) */ cube_osago_ul_data dst
+        USING
+        (
+        select OWN_HASH, ROW_NUMBER()OVER(ORDER BY OWN_HASH) rn FROM
+        (
+        SELECT OWN_HASH FROM cube_osago_ul_data  GROUP bY OWN_HASH
+        )
+        ) src
+        ON (src.OWN_HASH = dst.OWN_HASH)
+        WHEN MATCHED THEN UPDATE
+        SET
+            OWN_N = src.RN;   
+            
+            
+        MERGE INTO /* +PARALLEL(CUBE_OSAGO_UL_DATA) */ cube_osago_ul_data dst
+        USING
+        (
+        select INS_HASH, ROW_NUMBER()OVER(ORDER BY INS_HASH) rn FROM
+        (
+        SELECT INS_HASH FROM cube_osago_ul_data  GROUP bY INS_HASH
+        )
+        ) src
+        ON (src.INS_HASH = dst.INS_HASH)
+        WHEN MATCHED THEN UPDATE
+        SET
+            INS_N = src.RN;     
+            
+            
+        --UPDATE /* +PARALLEL(CUBE_OSAGO_UL_DATA) */ cube_osago_ul_data
+        --SET
+        --    SALE_POL_NOT_ANUL = DECODE(POLICY_STATUS, 'ДЕЙСТВУЮЩИЙ', 1, 0),
+        --    SALE_POL_W_ANUL = DECODE(POLICY_STATUS, 'ДЕЙСТВУЮЩИЙ', 1, 'АННУЛИРОВАННЫЙ', 1, 0);
+        
+        --UPDATE /* +PARALLEL(CUBE_OSAGO_UL_DATA) */ CUBE_OSAGO_UL_DATA
+        --SET 
+        --SALE_POL_NOT_ANUL_NRP = DECODE(RTDM_RES_REINSURANCE_POOL, 1, 0, SALE_POL_NOT_ANUL)
+        --WHERE
+        --SALE_POL_NOT_ANUL = 1;
+        
+        --MERGE INTO /* +PARALLEL(cube_osago_ul_data) */ CUBE_OSAGO_UL_DATA DST
+        --USING (SELECT CONTRACT_ID FROM ETL_POLICYREGISTRY_WA WHERE DOCUMENTSTATUSID IN ( 'FFE17B47-6238-4DFD-B3ED-FCA4104A39EE','0C9468DD-F53C-4962-8B0B-93BF28ABA6A9')) SRC
+        --ON (SRC.CONTRACT_ID = DST.FOUND_CONTRACT_ID AND DST.IS_CHECK_TCUW = 1)
+        --WHEN MATCHED THEN UPDATE SET IS_CHECK_TCUW_POLICY = 1 
+        --WHERE IS_LAST_CALL = 1; 
+        --COMMIT;
+/*        
+        MERGE INTO CUBE_OSAGO_UL_DATA X
+        USING
+        (
+            SELECT
+                mp.POLICY_NO, SUM(ap.POLICY_COUNT) POLICY_COUNT
+            FROM
+            (
+                SELECT
+                    POLICY_NO, POLICY_ID 
+                FROM
+                    ADI_POLICY 
+                WHERE 
+                    MAIN_POLICY_ID = POLICY_ID AND PRODUCT_NAME = 'ОСАГО' AND ISSUE_DATE >= date'2022-01-01'  
+            ) mp INNER JOIN
+            (
+                SELECT 
+                    main_policy_id, 
+                    COUNT(POLICY_ID) POLICY_COUNT 
+                FROM 
+                    ADI_POLICY 
+                WHERE 
+                    PRODUCT_NAME = 'ОСАГО' AND 
+                    ISSUE_DATE >= date'2022-01-01' AND
+                    UPPER(policy_status_name) = 'АКТИВНЫЙ' 
+                GROUP BY main_policy_id
+            ) ap ON ap.main_policy_id = mp.policy_id
+            GROUP BY mp.POLICY_NO
+        ) src on (src.policy_no = concat(x.policy_serial,x.policy_number))
+        WHEN MATCHED THEN UPDATE SET AGR_COUNT = src.POLICY_COUNT - 1;
+  */
+        COMMIT;
+
+    END sp_osago_ul_update;
+    
+    -- заполняет таблицу результатами с одного прода
+    PROCEDURE sp_osago_ul_collect_by_prod(p_res OUT integer, p_msg OUT varchar2, p_prod_id IN integer, p_from_date IN date, p_till_date IN date)
+    IS
+        v_from_run_id number;
+        v_till_run_id number;
+        v_now date;
+        v_rec_count integer;
+    BEGIN
+        v_now := SYSDATE;
+        p_res := 0;
+        p_msg := 'Загрузка данных с PROD_' || TO_CHAR(p_prod_id) || ': ';
+        v_rec_count := 0;
+        
+        BEGIN
+            EXECUTE IMMEDIATE 'CREATE OR REPLACE SYNONYM CUBE_OSAGO_UL_APP FOR "RTDM_1_' || TO_CHAR(p_prod_id) || '_MAIN"."APPLICATION"';
+            EXECUTE IMMEDIATE 'CREATE OR REPLACE SYNONYM CUBE_OSAGO_UL_PSN FOR "RTDM_1_' || TO_CHAR(p_prod_id) || '_MAIN"."PERSON"';
+            EXECUTE IMMEDIATE 'CREATE OR REPLACE SYNONYM CUBE_OSAGO_UL_RES FOR "RTDM_1_' || TO_CHAR(p_prod_id) || '_MAIN"."RTDM_RESULT"';
+            EXECUTE IMMEDIATE 'CREATE OR REPLACE SYNONYM CUBE_OSAGO_UL_CP FOR "RTDM_1_' || TO_CHAR(p_prod_id) || '_MAIN"."CALC_PARAMETERS"';
+            EXECUTE IMMEDIATE 'CREATE OR REPLACE SYNONYM CUBE_OSAGO_UL_CR FOR "RTDM_1_' || TO_CHAR(p_prod_id) || '_MAIN"."CALCULATE_RESPONSE"';
+            EXECUTE IMMEDIATE 'CREATE OR REPLACE SYNONYM CUBE_OSAGO_UL_VEH FOR "RTDM_1_' || TO_CHAR(p_prod_id) || '_MAIN"."VEHICLE"';
+            EXECUTE IMMEDIATE 'CREATE OR REPLACE SYNONYM CUBE_OSAGO_UL_TF FOR "RTDM_1_' || TO_CHAR(p_prod_id) || '_MAIN"."TARIFFS_OSAGO"';
+            EXECUTE IMMEDIATE 'CREATE OR REPLACE SYNONYM CUBE_OSAGO_UL_ADDR FOR "RTDM_1_' || TO_CHAR(p_prod_id) || '_MAIN"."ADDRESS"';
+            EXECUTE IMMEDIATE 'CREATE OR REPLACE SYNONYM CUBE_OSAGO_UL_TD FOR "RTDM_1_' || TO_CHAR(p_prod_id) || '_MAIN"."TC_INFO_RESPONSE"';
+            EXECUTE IMMEDIATE 'CREATE OR REPLACE SYNONYM CUBE_OSAGO_UL_RULE FOR "RTDM_1_' || TO_CHAR(p_prod_id) || '_MAIN"."RTDM_RULE"';
+            EXECUTE IMMEDIATE 'CREATE OR REPLACE SYNONYM CUBE_OSAGO_UL_LS FOR "RTDM_1_' || TO_CHAR(p_prod_id) || '_MAIN"."LOG_SEGMENTATION"';
+            EXECUTE IMMEDIATE 'CREATE OR REPLACE SYNONYM CUBE_OSAGO_UL_AGN FOR "RTDM_1_' || TO_CHAR(p_prod_id) || '_MAIN"."AGENT"'; 
+            EXECUTE IMMEDIATE 'CREATE OR REPLACE SYNONYM CUBE_OSAGO_UL_AHNTR_INN FOR "RTDM_1_' || TO_CHAR(p_prod_id) || '_MAIN"."AHUNTER_INN"';
+            EXECUTE IMMEDIATE 'CREATE OR REPLACE SYNONYM CUBE_OSAGO_UL_CP_TC FOR "RTDM_1_' || TO_CHAR(p_prod_id) || '_MAIN"."CALC_PARAMETERS_TC"';
+            EXECUTE IMMEDIATE 'CREATE OR REPLACE SYNONYM CUBE_OSAGO_UL_AUTOSTAT FOR "RTDM_1_' || TO_CHAR(p_prod_id) || '_MAIN"."AVTOSTAT_INFO"';
+             
+            EXECUTE IMMEDIATE 'CREATE OR REPLACE SYNONYM CUBE_OSAGO_UL_DICT_AGN FOR AGENT_GROUP';             
+            EXECUTE IMMEDIATE 'CREATE OR REPLACE SYNONYM CUBE_OSAGO_UL_DICT_CHNL FOR "RTDM_1_1_DICT_R"."DICT_CHANNEL"';
+            EXECUTE IMMEDIATE 'CREATE OR REPLACE SYNONYM CUBE_OSAGO_UL_DICT_KLADR FOR "RTDM_1_1_DICT_R"."DICT_KLADR"';
+            EXECUTE IMMEDIATE 'CREATE OR REPLACE SYNONYM CUBE_OSAGO_UL_DICT_RULE FOR "RTDM_1_1_DICT"."DICT_RULES"';
+
+        EXCEPTION
+            WHEN OTHERS THEN
+                p_res := -1;
+                p_msg := p_msg || 'Ошибка создания синонимов';
+        END;
+        
+        IF p_res != 0 THEN
+            RETURN;
+        END IF;
+        
+        SELECT MAX(RUN_ID) INTO v_till_run_id FROM CUBE_OSAGO_UL_APP WHERE RUN_ID > 0 and CALCULATIONDATE < p_till_date;
+        SELECT MIN(RUN_ID) INTO v_from_run_id FROM CUBE_OSAGO_UL_APP WHERE RUN_ID > 0 and CALCULATIONDATE >= p_from_date;
+
+        IF v_from_run_id IS NULL AND v_till_run_id IS NULL THEN
+            p_res := 0;
+            p_msg := p_msg || 'Обработано 0 записей (интервал пустой). Время выполнения: ' || TO_CHAR(TRUNC(SYSDATE - v_now)*24*60) || ' секунд.';
+            RETURN;
+        END IF;
+                
+        -- готовим таблицы один к одному с заявкой
+        BEGIN
+            EXECUTE IMMEDIATE 'DROP TABLE CUBE_OSAGO_UL_RULE_TMP';
+        EXCEPTION
+            WHEN OTHERS THEN
+                IF SQLCODE != -942 THEN
+                    RAISE;
+                END IF;
+        END;
+        EXECUTE IMMEDIATE 'CREATE TABLE CUBE_OSAGO_UL_RULE_TMP (RUN_ID NUMBER, ALL_RULES VARCHAR2(1000 CHAR), ONE_RULE VARCHAR2(50 CHAR))';
+        EXECUTE IMMEDIATE 'ALTER TABLE CUBE_OSAGO_UL_RULE_TMP ADD RULE_MODEL_FLAG INTEGER';
+        EXECUTE IMMEDIATE 'ALTER TABLE CUBE_OSAGO_UL_RULE_TMP ADD RULE_STOP_OKVED_FLAG INTEGER';
+        EXECUTE IMMEDIATE 'ALTER TABLE CUBE_OSAGO_UL_RULE_TMP ADD RULE_MODEL_LOSS_FLAG INTEGER';
+        EXECUTE IMMEDIATE 'ALTER TABLE CUBE_OSAGO_UL_RULE_TMP ADD RULE_MODEL_UL_FRAUD_CUTOFF_FLAG INTEGER';
+        EXECUTE IMMEDIATE 'ALTER TABLE CUBE_OSAGO_UL_RULE_TMP ADD RULE_BLACKLISTS_FLAG INTEGER';
+        EXECUTE IMMEDIATE 'ALTER TABLE CUBE_OSAGO_UL_RULE_TMP ADD RULE_NON_TARGET_RULE VARCHAR2(50 CHAR)';
+        EXECUTE IMMEDIATE 'ALTER TABLE CUBE_OSAGO_UL_RULE_TMP ADD RULE_IS_TARGET_SEGMENT INTEGER';
+
+        INSERT INTO CUBE_OSAGO_UL_RULE_TMP(RUN_ID, ALL_RULES)
+        SELECT 
+            app.RUN_ID,
+            LISTAGG(rl.RULE_ID , ', ') WITHIN GROUP( ORDER BY dl.RULE_ORDER, dl.RULE_ID) ALL_RULES
+        FROM 
+            CUBE_OSAGO_UL_APP app INNER JOIN
+            CUBE_OSAGO_UL_RULE rl ON app.RUN_ID = rl.RUN_ID AND rl.RULE_ID != 'SEGMENTATION_RULE' INNER JOIN
+            CUBE_OSAGO_UL_DICT_RULE dl ON rl.RULE_ID = dl.RULE_ID AND rl.DIAGRAM_ID = dl.DIAGRAM_ID and dl.VALID_FROM <= app.APPLICATIONDATE AND dl.VALID_TO >= app.APPLICATIONDATE
+        WHERE 
+            app.PRODUCTCODE = 'ОСАГО ЮЛ' AND
+            app.RUN_ID BETWEEN v_from_run_id AND v_till_run_id AND
+            UPPER(app.CORRELATION_ID) != 'TEST_RTDM' AND
+            rl.RESULT = 1
+        GROUP BY app.RUN_ID;
+
+        UPDATE CUBE_OSAGO_UL_RULE_TMP
+        SET
+            ONE_RULE = SUBSTR(ALL_RULES, 1, INSTR(ALL_RULES, ',')-1)
+        WHERE
+            ALL_RULES LIKE '%,%';
+               
+        UPDATE CUBE_OSAGO_UL_RULE_TMP
+        SET 
+            RULE_MODEL_FLAG = 
+                                CASE
+                                    WHEN 
+                                        ALL_RULES LIKE '%DAYS30_RULE%' OR
+                                        ALL_RULES LIKE '%FRAUD_RULE%' OR
+                                        ALL_RULES LIKE '%PVU_RULE%' OR
+                                        ALL_RULES LIKE '%TRADITION_RULE%' OR
+                                        ALL_RULES LIKE '%OSAGO_UL_FRAUD_CUTOFF%' OR
+                                        ALL_RULES LIKE '%CHECK_TYPE_TS%' OR
+                                        ALL_RULES LIKE '%PVU_2_0%' OR
+                                        ALL_RULES LIKE '%TAXI_MODEL_CHECK%' OR
+                                        (
+                                            (
+                                                ALL_RULES LIKE '%LOSS_RATIO_CASH_BOUND%' OR
+                                                ALL_RULES LIKE '%LOSS_RATIO_BOUND%'
+                                            ) AND
+                                            (
+                                                ALL_RULES NOT LIKE '%KASKO_CHECK%' AND 
+                                                ALL_RULES NOT LIKE '%LOSS_RATIO_WHITE%' AND 
+                                                ALL_RULES NOT LIKE '%LOSS_RATIO_BOUND_MODIF%' AND 
+                                                ALL_RULES NOT LIKE '%WHITELIST_FIO_INS%' AND 
+                                                ALL_RULES NOT LIKE '%WHITELIST_FIO_OWN%' AND 
+                                                ALL_RULES NOT LIKE '%WHITELIST_RENEW%' AND 
+                                                ALL_RULES NOT LIKE '%WHITELIST_RENEW_PREV_POLICY%' AND 
+                                                ALL_RULES NOT LIKE '%LOSS_RATIO_BOUND_UL%' AND 
+                                                ALL_RULES NOT LIKE '%FOLLOWING_AT_REGPLACE_UL%' AND 
+                                                ALL_RULES NOT LIKE '%NONPASSENGER_CHECK%' AND 
+                                                ALL_RULES NOT LIKE '%PLACE_OF_REG_CHECK%' AND 
+                                                ALL_RULES NOT LIKE '%POWER_MAX_BOUND_CHECK%' AND 
+                                                ALL_RULES NOT LIKE '%PROLONGATION_CHECK%' AND 
+                                                ALL_RULES NOT LIKE '%PROLONGATION_UL%' AND 
+                                                ALL_RULES NOT LIKE '%TEMPORAL_RULE>70_CAR_UL%' AND 
+                                                ALL_RULES NOT LIKE '%WHITE_LIST_UL%' AND 
+                                                ALL_RULES NOT LIKE '%TRACTOR_RULE%'
+                                            )
+                                        )
+                                    THEN 1
+                                    ELSE 0
+                                END,
+            RULE_STOP_OKVED_FLAG = 
+                                CASE 
+                                    WHEN ALL_RULES LIKE '%BLACKLIST_OKVED_UL%'
+                                    THEN 1
+                                    ELSE 0
+                                END,
+            RULE_MODEL_UL_FRAUD_CUTOFF_FLAG = 
+                                CASE
+                                    WHEN ALL_RULES LIKE '%OSAGO_UL_FRAUD_CUTOFF%'
+                                    THEN 1
+                                    ELSE 0
+                                END,
+            RULE_BLACKLISTS_FLAG =
+                                CASE
+                                    WHEN 
+                                        ALL_RULES LIKE '%B+TAXI_UL%' OR
+                                        ALL_RULES LIKE '%BLACKLIST_FIO_INS%' OR
+                                        ALL_RULES LIKE '%BLACKLIST_FIO_OWN%' OR
+                                        ALL_RULES LIKE '%BLACKLIST_IP%' OR
+                                        ALL_RULES LIKE '%BLACKLIST_PASSPORT_INS%' OR
+                                        ALL_RULES LIKE '%BLACKLIST_PASSPORT_OWN%' OR
+                                        ALL_RULES LIKE '%BLACKLIST_VIN%' OR
+                                        ALL_RULES LIKE '%CUSTOMER_ADD_INS%' OR
+                                        ALL_RULES LIKE '%CUSTOMER_ADD_OWN%' OR
+                                        ALL_RULES LIKE '%STOP_LIST_AGENT%' OR
+                                        ALL_RULES LIKE '%GRANICA_BLACK_FILIAL_AGENT_UL%'
+                                    THEN 1
+                                    ELSE 0
+                                END,
+            RULE_MODEL_LOSS_FLAG = 
+                                CASE
+                                    WHEN 
+                                        (
+                                            ALL_RULES LIKE '%LOSS_RATIO_CASH_BOUND%' OR
+                                            ALL_RULES LIKE '%LOSS_RATIO_BOUND%'
+                                        )
+                                        AND 
+                                        (
+                                            ALL_RULES NOT LIKE '%KASKO_CHECK%' OR
+                                            ALL_RULES NOT LIKE '%LOSS_RATIO_WHITE%' OR
+                                            ALL_RULES NOT LIKE '%LOSS_RATIO_BOUND_MODIF%' OR
+                                            ALL_RULES NOT LIKE '%WHITELIST_FIO_INS%' OR
+                                            ALL_RULES NOT LIKE '%WHITELIST_FIO_OWN%' OR
+                                            ALL_RULES NOT LIKE '%WHITELIST_RENEW%' OR
+                                            ALL_RULES NOT LIKE '%WHITELIST_RENEW_PREV_POLICY%' OR
+                                            ALL_RULES NOT LIKE '%LOSS_RATIO_BOUND_UL%' OR
+                                            ALL_RULES NOT LIKE '%FOLLOWING_AT_REGPLACE_UL%' OR
+                                            ALL_RULES NOT LIKE '%NONPASSENGER_CHECK%' OR
+                                            ALL_RULES NOT LIKE '%PLACE_OF_REG_CHECK%' OR
+                                            ALL_RULES NOT LIKE '%POWER_MAX_BOUND_CHECK%' OR
+                                            ALL_RULES NOT LIKE '%PROLONGATION_CHECK%' OR
+                                            ALL_RULES NOT LIKE '%PROLONGATION_UL%' OR
+                                            ALL_RULES NOT LIKE '%TEMPORAL_RULE>70_CAR_UL%' OR
+                                            ALL_RULES NOT LIKE '%WHITE_LIST_UL%' OR
+                                            ALL_RULES NOT LIKE '%TRACTOR_RULE%'
+                                        )
+                                    THEN 1
+                                    ELSE 0
+                                END,
+            RULE_NON_TARGET_RULE = NULL;
+        COMMIT;
+
+        BEGIN
+            EXECUTE IMMEDIATE 'DROP TABLE CUBE_OSAGO_UL_CP_TMP';
+        EXCEPTION
+            WHEN OTHERS THEN
+                IF SQLCODE != -942 THEN
+                    RAISE;
+                END IF;
+        END;
+        
+        EXECUTE IMMEDIATE 'CREATE TABLE CUBE_OSAGO_UL_CP_TMP (RUN_ID NUMBER)';
+        EXECUTE IMMEDIATE 'ALTER TABLE CUBE_OSAGO_UL_CP_TMP ADD ASSIGN_RATIO_BOUND_PASS NUMBER';
+        EXECUTE IMMEDIATE 'ALTER TABLE CUBE_OSAGO_UL_CP_TMP ADD KANAL_PRODAZH_MAP VARCHAR2(100 CHAR)';
+        EXECUTE IMMEDIATE 'ALTER TABLE CUBE_OSAGO_UL_CP_TMP ADD SAVE_OFFER NUMBER';
+        EXECUTE IMMEDIATE 'ALTER TABLE CUBE_OSAGO_UL_CP_TMP ADD FILIAL VARCHAR2(100 CHAR)';
+        EXECUTE IMMEDIATE 'ALTER TABLE CUBE_OSAGO_UL_CP_TMP ADD STREAM VARCHAR2(100 CHAR)'; 
+        EXECUTE IMMEDIATE 'ALTER TABLE CUBE_OSAGO_UL_CP_TMP ADD LOTUS_DEPARTAMENT VARCHAR2(100 CHAR)';
+        EXECUTE IMMEDIATE 'ALTER TABLE CUBE_OSAGO_UL_CP_TMP ADD LIFE_HEALTH NUMBER';
+        EXECUTE IMMEDIATE 'ALTER TABLE CUBE_OSAGO_UL_CP_TMP ADD COURT NUMBER';
+        EXECUTE IMMEDIATE 'ALTER TABLE CUBE_OSAGO_UL_CP_TMP ADD UNDERWRITER_ACCEPT VARCHAR2(100 CHAR)';
+        EXECUTE IMMEDIATE 'ALTER TABLE CUBE_OSAGO_UL_CP_TMP ADD EXPECTED_LOSS NUMBER';
+        EXECUTE IMMEDIATE 'ALTER TABLE CUBE_OSAGO_UL_CP_TMP ADD EXPECTED_LOSS_RATIO NUMBER';
+        EXECUTE IMMEDIATE 'ALTER TABLE CUBE_OSAGO_UL_CP_TMP ADD FINAL_BRAND VARCHAR2(100 CHAR)';
+        EXECUTE IMMEDIATE 'ALTER TABLE CUBE_OSAGO_UL_CP_TMP ADD FINAL_MODEL VARCHAR2(100 CHAR)';
+        EXECUTE IMMEDIATE 'ALTER TABLE CUBE_OSAGO_UL_CP_TMP ADD FINAL_MODEL_GROUP VARCHAR2(100 CHAR)';
+        EXECUTE IMMEDIATE 'ALTER TABLE CUBE_OSAGO_UL_CP_TMP ADD LOTUS_CHANNEL VARCHAR2(100 CHAR)';
+        EXECUTE IMMEDIATE 'ALTER TABLE CUBE_OSAGO_UL_CP_TMP ADD STREAM_CHANGE NUMBER';
+        EXECUTE IMMEDIATE 'ALTER TABLE CUBE_OSAGO_UL_CP_TMP ADD OKVED_INSURER VARCHAR2(20 CHAR)';
+        EXECUTE IMMEDIATE 'ALTER TABLE CUBE_OSAGO_UL_CP_TMP ADD OKVED_OWNER VARCHAR2(20 CHAR)';
+        EXECUTE IMMEDIATE 'ALTER TABLE CUBE_OSAGO_UL_CP_TMP ADD FIX_RATE_REINSURANCE NUMBER';
+        EXECUTE IMMEDIATE 'ALTER TABLE CUBE_OSAGO_UL_CP_TMP ADD PREMIUM_DCO NUMBER';
+        EXECUTE IMMEDIATE 'ALTER TABLE CUBE_OSAGO_UL_CP_TMP ADD TARIFFF_DCO NUMBER';
+        EXECUTE IMMEDIATE 'ALTER TABLE CUBE_OSAGO_UL_CP_TMP ADD KOEF_DCO NUMBER';
+        EXECUTE IMMEDIATE 'ALTER TABLE CUBE_OSAGO_UL_CP_TMP ADD BACKGROUND_MODEL_NAME VARCHAR2(250 CHAR)';
+        EXECUTE IMMEDIATE 'ALTER TABLE CUBE_OSAGO_UL_CP_TMP ADD EXPECTED_LOSS_RATIO_SEC NUMBER';
+        EXECUTE IMMEDIATE 'ALTER TABLE CUBE_OSAGO_UL_CP_TMP ADD EXPECTED_LOSS_SEC NUMBER';
+        EXECUTE IMMEDIATE 'ALTER TABLE CUBE_OSAGO_UL_CP_TMP ADD REPLY_RTDM_SEC VARCHAR2(250 CHAR)';
+        
+
+        INSERT ALL INTO CUBE_OSAGO_UL_CP_TMP
+        SELECT 
+                  RUN_ID
+                 ,MAX(CASE WHEN UPPER(NAME) = 'ASSIGN_RATIO_BOUND_PASS' THEN VALUE END) ASSIGN_RATIO_BOUND_PASS
+                 ,MAX(CASE WHEN UPPER(NAME) = 'KANAL_PRODAZH_MAP_UL' THEN text END) KANAL_PRODAZH_MAP
+                 ,MAX(CASE WHEN UPPER(NAME) = 'SAVE_OFFER_FLG' THEN VALUE END) SAVE_OFFER
+                 ,MAX(CASE WHEN UPPER(NAME) = 'FILIAL' THEN text END) FILIAL                  
+                 ,MAX(CASE WHEN UPPER(NAME) = 'STREAM_OSAGO_UL' THEN text END) STREAM
+                 ,MAX(CASE WHEN UPPER(NAME) = 'LOTUS_DEPARTAMENT' THEN text END) LOTUS_DEPARTAMENT
+                 ,MAX(CASE WHEN UPPER(NAME) = 'LIFE_HEALTH' THEN VALUE END) LIFE_HEALTH
+                 ,MAX(CASE WHEN UPPER(NAME) = 'COURT' THEN VALUE END) COURT
+                 ,MAX(CASE WHEN UPPER(NAME) = 'UNDERWRITER_ACCEPT' THEN text END) UNDERWRITER_ACCEPT
+                 ,MAX(CASE WHEN UPPER(NAME) = 'EXPECTED-LOSS_COEFF' THEN VALUE END) EXPECTED_LOSS
+                 ,MAX(CASE WHEN UPPER(NAME) = 'EXPECTED_LOSS_RATIO' THEN VALUE END) EXPECTED_LOSS_RATIO
+                 ,MAX(CASE WHEN UPPER(NAME) = 'FINAL_BRAND' THEN text END) FINAL_BRAND
+                 ,MAX(CASE WHEN UPPER(NAME) = 'FINAL_MODEL' THEN text END) FINAL_MODEL
+                 ,MAX(CASE WHEN UPPER(NAME) = 'FINAL_MODEL_GROUP' THEN text END) FINAL_MODEL_GROUP
+                 ,MAX(CASE WHEN UPPER(NAME) = 'LOTUS_CHANNEL' THEN text END) LOTUS_CHANNEL                  
+                 ,MAX(CASE WHEN UPPER(NAME) = 'STREAM_CHANGE' THEN VALUE END) STREAM_CHANGE           
+                 ,MAX(CASE WHEN UPPER(NAME) = 'OKVED_INSURER' THEN text END) OKVED_INSURER                 
+                 ,MAX(CASE WHEN UPPER(NAME) = 'OKVED_OWNER' THEN text END) OKVED_OWNER
+                 ,MAX(CASE WHEN UPPER(NAME) = 'FIX_RATE_REINSURANCE' THEN VALUE END) FIX_RATE_REINSURANCE
+                 ,MAX(CASE WHEN UPPER(NAME) = 'PREMIUM_DCO' THEN VALUE END) PREMIUM_DCO
+                 ,MAX(CASE WHEN UPPER(NAME) = 'TARIFFF_DCO' THEN VALUE END) TARIFFF_DCO
+                 ,MAX(CASE WHEN UPPER(NAME) = 'KOEF_DCO' THEN VALUE END) KOEF_DCO
+                 ,MAX(CASE WHEN UPPER(NAME) = 'OSAGO_UL_AUTOML_2023_SECOND_USE' THEN text END) BACKGROUND_MODEL_NAME
+                 ,MAX(CASE WHEN UPPER(NAME) = 'EXPECTED_LOSS_RATIO_2023_SEC' THEN VALUE END) EXPECTED_LOSS_RATIO_SEC
+                 ,MAX(CASE WHEN UPPER(NAME) = 'EXPECTED_LOSS_COEFF_2023_SEC' THEN VALUE END) EXPECTED_LOSS_SEC
+                 ,MAX(CASE WHEN UPPER(NAME) = 'RTDM_RESULT_SECOND' THEN text END) REPLY_RTDM_SEC
+                 
+        FROM 
+            CUBE_OSAGO_UL_CP
+        WHERE 
+            RUN_ID BETWEEN v_from_run_id AND v_till_run_id
+        GROUP BY RUN_ID;
+
+        COMMIT;
+        
+        BEGIN
+            EXECUTE IMMEDIATE 'DROP TABLE CUBE_OSAGO_UL_INS_TMP';
+        EXCEPTION
+            WHEN OTHERS THEN
+                IF SQLCODE != -942 THEN
+                    RAISE;
+                END IF;
+        END;
+        EXECUTE IMMEDIATE 'CREATE TABLE CUBE_OSAGO_UL_INS_TMP AS SELECT * FROM CUBE_OSAGO_UL_INS WHERE 1=0';
+
+        INSERT INTO CUBE_OSAGO_UL_INS_TMP(
+            PROD_ID, RUN_ID, REQUEST_UNIQUE_HASH, CONTRACT_ID, CALL_NUMBER, CALCULATION_DATE, CORRELATION_ID, REQSOURCE_NAME, CONTRACT_DATE, CONTRACT_START_DATE, CONTRACT_END_DATE, APPLICATION_DATE, SYS_CREATE_USER, SALE_CHANNEL_ID, SALE_CHANNEL_NAME, BRANCHSKK_NAME, FILIAL_NAME, FILIAL_DIVISION_NAME, PARTNER_CODE, AGENT_DOC_NUMBER, AGENT_NAME, AGENT_GROUP, HOLDING_NAME, DIVISION_NAME, LOGIN, IS_GOVERMENT_CONTRACT, IS_TERMINATION, IS_AGREEMENT, IS_INTEGRATION, IS_PROLONGATION, PREV_POLICY_SERIAL, PREV_POLICY_NUMBER, IP_ADDRESS, IS_LOST_POLICY, IS_CHECK_TCUW, INSURER_ID, INS_FIO, INS_BIRTHDATE, INS_SEX, INS_IS_MARRIED, INS_INN, INS_ORG_NAME, INS_AGE, INS_REG_KLADR, INS_REGION, OWNER_ID, OWN_FIO, OWN_BIRTHDATE, OWN_SEX, OWN_IS_MARRIED, OWN_INN, OWN_ORG_NAME, OWN_AGE, OWN_REG_KLADR, OWN_REGION, VEH_TYPE_OSAGO, VEH_TYPE_GROUP, VEH_VIN, VEH_RUN, VEH_OWNER_COUNT, VEH_BRAND, VEH_BRAND_ID, VEH_CONSTRUCTION_YEAR, VEH_ENGINE_POWERHP, VEH_IS_TRAILER, VEH_KIND_NAME, VEH_PLATE_NUM, VEH_MODEL_NAME, VEH_MODEL_ID, VEH_CHASSIS_NUM, VEH_BODY_NUM, VEH_PURPOSE, RTDM_RES_CODE, RTDM_RES_ERR_RSA, RTDM_RES_DECL_CAT, RTDM_RES_REINSURANCE_POOL, TRF_COEF_KT, TRF_COEF_KBM, TRF_COEF_KO, TRF_COEF_KVS, TRF_COEF_KM, TRF_COEF_KP, TRF_COEF_KS, TRF_FINAL_PREMIUM, TRF_TARIFF, TRF_COEF_TB_MAX, TRF_COEF_TB_MIN, TRF_MAX_PREMIUM, TRF_MIN_PREMIUM, RULE_ALL_RULES, RULE_ONE_RULE, RULE_MODEL_FLAG, RULE_STOP_OKVED_FLAG, RULE_MODEL_LOSS_FLAG, RULE_MODEL_UL_FRAUD_CUTOFF_FLAG, RULE_BLACKLISTS_FLAG, RULE_NON_TARGET_RULE, RULE_IS_TARGET_SEGMENT, CP_ASSIGN_RATIO_BOUND_PASS, CP_KANAL_PRODAZH_MAP, CP_SAVE_OFFER, CP_FILIAL, CP_STREAM, CP_LOTUS_DEPARTAMENT, CP_LOTUS_CHANNEL, CP_LIFE_HEALTH, CP_COURT, CP_UNDERWRITER_ACCEPT, CP_EXPECTED_LOSS, CP_EXPECTED_LOSS_RATIO, CP_FINAL_BRAND, CP_FINAL_MODEL, CP_FINAL_MODEL_GROUP, CP_STREAM_CHANGE, CP_OKVED_OWNER, CP_OKVED_INSURER, IS_SEGMENTATION, TRF_BASIC_TARIFF_CALC, LIB_CHISLENNOST_K, LIB_RASSTOYANIE_K, LIB_REGION_KLADR_K, LIB_REGION_PASPORT_K, LIB_STOLICA_K, LIB_TIP_TS_K, LIB_CEL_ISPOLZOVANIYA_K, LIB_DATE_DIF_K, LIB_VOZRAST_SOBSTVENNIKA_K, LIB_VOZRAST_TS_K, LIB_KOLVO_VODITELEJ_K, LIB_PASPORT_RF_K, LIB_STRAHOVATEL_SOBSTVENNIK_K, LIB_PRISEP_K, LIB_MARKA_K, LIB_KBM_K, LIB_FILIAL_KLADR_RASSTOYANIE_K, LIB_CHANNEL_K, LIB_OKVED_K, LIB_PARK_TS_K, LIB_MARRIED_K, LIB_PROLONGATION_K, LIB_LOGIN_COEF, LIB_PREV_INSURER_COEF, LIB_PROLONGATION_PERIOD_COEF, LIB_POWER_COEF, TRF_LOTUS_KT_COEF, TRF_INN_BASIC, TRF_K_EQUALIZER, KBM_CLASS, CP_FIX_RATE_REINSURANCE,
+            INS_HASH, OWN_HASH, INS_INN_HASH, OWN_INN_HASH, VEH_HASH,  agr_kbm_val,agr_other_val,agr_psn_val,agr_veh_val,  CP_CITIZENSHIPCODE_CALC, SVETOFOR_RSA, IS_AUTOSTAT_CALLED,CP_PREMIUM_DCO, CP_TARIFFF_DCO, CP_KOEF_DCO, AGENT_BANK_OWNER, CP_BACKGROUND_MODEL_NAME, CP_EXPECTED_LOSS_RATIO_SEC, CP_EXPECTED_LOSS_SEC, CP_REPLY_RTDM_SEC, TRF_COEF_KN, TRF_COEF_KPR
+        )
+    SELECT
+        PROD_ID, RUN_ID, REQUEST_UNIQUE_HASH, CONTRACT_ID, CALL_NUMBER, CALCULATION_DATE, CORRELATION_ID, REQSOURCE_NAME, CONTRACT_DATE, CONTRACT_START_DATE, CONTRACT_END_DATE, APPLICATION_DATE, SYS_CREATE_USER, SALE_CHANNEL_ID, SALE_CHANNEL_NAME, BRANCHSKK_NAME, FILIAL_NAME, FILIAL_DIVISION_NAME, PARTNER_CODE, AGENT_DOC_NUMBER, AGENT_NAME, AGENT_GROUP, HOLDING_NAME, DIVISION_NAME, LOGIN, IS_GOVERMENT_CONTRACT, IS_TERMINATION, IS_AGREEMENT, IS_INTEGRATION, IS_PROLONGATION, PREV_POLICY_SERIAL, PREV_POLICY_NUMBER, IP_ADDRESS, IS_LOST_POLICY, IS_CHECK_TCUW, INSURER_ID, INS_FIO, INS_BIRTHDATE, INS_SEX, INS_IS_MARRIED, INS_INN, INS_ORG_NAME, INS_AGE, INS_REG_KLADR, INS_REGION, OWNER_ID, OWN_FIO, OWN_BIRTHDATE, OWN_SEX, OWN_IS_MARRIED, OWN_INN, OWN_ORG_NAME, OWN_AGE, OWN_REG_KLADR, OWN_REGION, VEH_TYPE_OSAGO, VEH_TYPE_GROUP, VEH_VIN, VEH_RUN, VEH_OWNER_COUNT, VEH_BRAND, VEH_BRAND_ID, VEH_CONSTRUCTION_YEAR, VEH_ENGINE_POWERHP, VEH_IS_TRAILER, VEH_KIND_NAME, VEH_PLATE_NUM, VEH_MODEL_NAME, VEH_MODEL_ID, VEH_CHASSIS_NUM, VEH_BODY_NUM, VEH_PURPOSE, RTDM_RES_CODE, RTDM_RES_ERR_RSA, RTDM_RES_DECL_CAT, RTDM_RES_REINSURANCE_POOL, TRF_COEF_KT, TRF_COEF_KBM, TRF_COEF_KO, TRF_COEF_KVS, TRF_COEF_KM, TRF_COEF_KP, TRF_COEF_KS, TRF_FINAL_PREMIUM, TRF_TARIFF, TRF_COEF_TB_MAX, TRF_COEF_TB_MIN, TRF_MAX_PREMIUM, TRF_MIN_PREMIUM, RULE_ALL_RULES, RULE_ONE_RULE, RULE_MODEL_FLAG, RULE_STOP_OKVED_FLAG, RULE_MODEL_LOSS_FLAG, RULE_MODEL_UL_FRAUD_CUTOFF_FLAG, RULE_BLACKLISTS_FLAG, RULE_NON_TARGET_RULE, RULE_IS_TARGET_SEGMENT, CP_ASSIGN_RATIO_BOUND_PASS, CP_KANAL_PRODAZH_MAP, CP_SAVE_OFFER, CP_FILIAL, CP_STREAM, CP_LOTUS_DEPARTAMENT, CP_LOTUS_CHANNEL, CP_LIFE_HEALTH, CP_COURT, CP_UNDERWRITER_ACCEPT, CP_EXPECTED_LOSS, CP_EXPECTED_LOSS_RATIO, CP_FINAL_BRAND, CP_FINAL_MODEL, CP_FINAL_MODEL_GROUP, CP_STREAM_CHANGE, CP_OKVED_OWNER, CP_OKVED_INSURER, IS_SEGMENTATION, TRF_BASIC_TARIFF_CALC, LIB_CHISLENNOST_K, LIB_RASSTOYANIE_K, LIB_REGION_KLADR_K, LIB_REGION_PASPORT_K, LIB_STOLICA_K, LIB_TIP_TS_K, LIB_CEL_ISPOLZOVANIYA_K, LIB_DATE_DIF_K, LIB_VOZRAST_SOBSTVENNIKA_K, LIB_VOZRAST_TS_K, LIB_KOLVO_VODITELEJ_K, LIB_PASPORT_RF_K, LIB_STRAHOVATEL_SOBSTVENNIK_K, LIB_PRISEP_K, LIB_MARKA_K, LIB_KBM_K, LIB_FILIAL_KLADR_RASSTOYANIE_K, LIB_CHANNEL_K, LIB_OKVED_K, LIB_PARK_TS_K, LIB_MARRIED_K, LIB_PROLONGATION_K, LIB_LOGIN_COEF, LIB_PREV_INSURER_COEF, LIB_PROLONGATION_PERIOD_COEF, LIB_POWER_COEF, TRF_LOTUS_KT_COEF, TRF_INN_BASIC, TRF_K_EQUALIZER, KBM_CLASS, CP_FIX_RATE_REINSURANCE,
+        NVL2(COALESCE(app.INS_ORG_NAME,app.INS_FIO), STANDARD_HASH(COALESCE(app.INS_ORG_NAME, app.INS_FIO || TO_CHAR(app.INS_BIRTHDATE, 'YYYYMMDD')), 'MD5'), NULL) INS_HASH,
+        NVL2(COALESCE(app.OWN_ORG_NAME,app.OWN_FIO), STANDARD_HASH(COALESCE(app.OWN_ORG_NAME, app.OWN_FIO || TO_CHAR(app.OWN_BIRTHDATE, 'YYYYMMDD')), 'MD5'), NULL) OWN_HASH,
+        NVL2(app.INS_INN, STANDARD_HASH(app.INS_INN, 'MD5'), NULL) INS_INN_HASH,
+        NVL2(app.OWN_INN, STANDARD_HASH(app.OWN_INN, 'MD5'), NULL) OWN_INN_HASH,
+        STANDARD_HASH(COALESCE(
+                                VEH_VIN,
+                                VEH_BODY_NUM,
+                                VEH_CHASSIS_NUM,
+                                VEH_PLATE_NUM,
+                                VEH_BRAND || VEH_MODEL_NAME
+                                ),'MD5') VEH_HASH,
+                                NULL agr_kbm_val,
+                                NULL agr_other_val,
+                                NULL agr_psn_val,
+                                NULL agr_veh_val,
+                                CP_CITIZENSHIPCODE_CALC, SVETOFOR_RSA, IS_AUTOSTAT_CALLED, CP_PREMIUM_DCO, CP_TARIFFF_DCO, CP_KOEF_DCO, AGENT_BANK_OWNER, CP_BACKGROUND_MODEL_NAME, CP_EXPECTED_LOSS_RATIO_SEC, CP_EXPECTED_LOSS_SEC, CP_REPLY_RTDM_SEC, TRF_COEF_KN, TRF_COEF_KPR
+    FROM
+    (
+        SELECT
+            p_prod_id PROD_ID,
+            app.RUN_ID,
+            CAST(STANDARD_HASH(app.CONTRACT_ID, 'MD5') AS VARCHAR2(36 char)) REQUEST_UNIQUE_HASH,
+            app.CONTRACT_ID,
+            app.CALL_NUMBER,
+            app.CALCULATION_DATE, 
+            app.CORRELATION_ID, 
+            app.REQSOURCE_NAME, 
+            app.CONTRACT_DATE, 
+            app.CONTRACT_START_DATE, 
+            app.CONTRACT_END_DATE, 
+            app.APPLICATION_DATE,
+            app.SYS_CREATE_USER,
+            app.SALE_CHANNEL_ID,
+            app.SALE_CHANNEL_NAME,
+            app.BRANCHSKK_NAME,
+            FILIAL_NAME,
+            FILIAL_DIVISION_NAME,
+            PARTNER_CODE,
+            AGENT_DOC_NUMBER,
+            AGENT_NAME,
+            AGENT_GROUP,
+            COALESCE(lb.HOLDING_NAME, a_holding.HOLDING_NAME, null) HOLDING_NAME,
+--            COALESCE(haid.NAME, han.NAME, hal.NAME, had.NAME) HOLDING_NAME,
+            DIVISION_NAME,
+            LOGIN,
+            IS_GOVERMENT_CONTRACT,
+            IS_TERMINATION,
+            IS_AGREEMENT,
+            IS_INTEGRATION,
+            IS_PROLONGATION,
+            PREV_POLICY_SERIAL,
+            PREV_POLICY_NUMBER,
+            IP_ADDRESS,
+            IS_LOST_POLICY,
+            IS_CHECK_TCUW,
+           
+            INSURER_ID,
+            CAST(UPPER(TRIM(TRIM(TRIM(psn_ins.LASTNAME) || ' ' || TRIM(psn_ins.FIRSTNAME)) || ' ' || TRIM(psn_ins.SECONDNAME))) AS VARCHAR2(200 CHAR)) INS_FIO,
+            NVL2(psn_ins.LASTNAME, TRUNC(psn_ins.BIRTHDATE), NULL) INS_BIRTHDATE,
+            NVL2(psn_ins.LASTNAME, psn_ins.SEX, NULL) INS_SEX,
+            NVL2(psn_ins.LASTNAME, psn_ins.ISMARRIED, NULL) INS_IS_MARRIED,
+            REGEXP_REPLACE(UPPER(psn_ins.INN), '[^0-9]') INS_INN,
+            REGEXP_REPLACE(REPLACE(REPLACE(REGEXP_REPLACE(COALESCE(ahntrinn_ins.SHORT_NAME, UPPER(CAST(psn_ins.ORGNAME AS VARCHAR2(200 CHAR)))), '[«»]', '"'), '" ', '"'), '""', '"'), '[^a-zA-Zа-яА-ЯёЁ0-9 .()"-]') INS_ORG_NAME,
+            CASE
+                WHEN psn_ins.LASTNAME IS NULL OR psn_ins.BIRTHDATE IS NULL THEN NULL
+                WHEN EXTRACT(MONTH FROM psn_ins.BIRTHDATE) < EXTRACT(MONTH FROM app.APPLICATION_DATE) THEN EXTRACT(YEAR FROM app.APPLICATION_DATE) - EXTRACT(YEAR FROM psn_ins.BIRTHDATE)
+                WHEN EXTRACT(MONTH FROM psn_ins.BIRTHDATE) > EXTRACT(MONTH FROM app.APPLICATION_DATE) THEN EXTRACT(YEAR FROM app.APPLICATION_DATE) - EXTRACT(YEAR FROM psn_ins.BIRTHDATE) -1
+                WHEN EXTRACT(MONTH FROM psn_ins.BIRTHDATE) = EXTRACT(MONTH FROM app.APPLICATION_DATE) AND EXTRACT(DAY FROM psn_ins.BIRTHDATE) > EXTRACT(DAY FROM app.APPLICATION_DATE) THEN EXTRACT(YEAR FROM app.APPLICATION_DATE) - EXTRACT(YEAR FROM psn_ins.BIRTHDATE) -1
+                ELSE EXTRACT(YEAR FROM app.APPLICATION_DATE) - EXTRACT(YEAR FROM psn_ins.BIRTHDATE)
+            END INS_AGE,
+            addr_ins.KLADRSTREET INS_REG_KLADR,
+            insreg.reg_name INS_REGION,
+                
+            OWNER_ID,
+            CAST(CASE 
+                WHEN OWNER_ID = INSURER_ID THEN
+                    UPPER(TRIM(TRIM(TRIM(psn_ins.LASTNAME) || ' ' || TRIM(psn_ins.FIRSTNAME)) || ' ' || TRIM(psn_ins.SECONDNAME))) 
+                ELSE
+                    UPPER(TRIM(TRIM(TRIM(psn_own.LASTNAME) || ' ' || TRIM(psn_own.FIRSTNAME)) || ' ' || TRIM(psn_own.SECONDNAME))) 
+            END AS VARCHAR2(200 CHAR)) OWN_FIO,
+            CASE 
+                WHEN OWNER_ID = INSURER_ID THEN
+                    NVL2(psn_ins.LASTNAME, TRUNC(psn_ins.BIRTHDATE), NULL)
+                ELSE
+                    NVL2(psn_own.LASTNAME, TRUNC(psn_own.BIRTHDATE), NULL)
+            END OWN_BIRTHDATE,
+            CASE 
+                WHEN OWNER_ID = INSURER_ID THEN
+                    NVL2(psn_ins.LASTNAME, psn_ins.SEX, NULL) 
+                ELSE
+                    NVL2(psn_own.LASTNAME, psn_own.SEX, NULL)
+            END OWN_SEX,
+            CASE 
+                WHEN OWNER_ID = INSURER_ID THEN
+                    NVL2(psn_ins.LASTNAME, psn_ins.ISMARRIED, NULL) 
+                ELSE
+                    NVL2(psn_own.LASTNAME, psn_own.ISMARRIED, NULL) 
+            END OWN_IS_MARRIED,
+            CASE 
+                WHEN OWNER_ID = INSURER_ID THEN
+                    REGEXP_REPLACE(UPPER(psn_ins.INN), '[^0-9]')
+                ELSE
+                    REGEXP_REPLACE(UPPER(psn_own.INN), '[^0-9]')
+            END OWN_INN,
+            CAST(CASE 
+                WHEN OWNER_ID = INSURER_ID THEN
+                    REGEXP_REPLACE(REPLACE(REPLACE(REGEXP_REPLACE(COALESCE(ahntrinn_ins.SHORT_NAME, UPPER(CAST(psn_ins.ORGNAME AS VARCHAR2(200 CHAR)))), '[«»]', '"'), '" ', '"'), '""', '"'), '[^a-zA-Zа-яА-ЯёЁ0-9 .()"-]')
+                ELSE
+                    REGEXP_REPLACE(REPLACE(REPLACE(REGEXP_REPLACE(COALESCE(ahntrinn_own.SHORT_NAME, UPPER(CAST(psn_own.ORGNAME AS VARCHAR2(200 CHAR)))), '[«»]', '"'), '" ', '"'), '""', '"'), '[^a-zA-Zа-яА-ЯёЁ0-9 .()"-]')
+            END AS VARCHAR2(200 CHAR)) OWN_ORG_NAME,    
+            CASE 
+                WHEN OWNER_ID = INSURER_ID THEN
+                    CASE
+                        WHEN psn_ins.LASTNAME IS NULL OR psn_ins.BIRTHDATE IS NULL THEN NULL
+                        WHEN EXTRACT(MONTH FROM psn_ins.BIRTHDATE) < EXTRACT(MONTH FROM app.APPLICATION_DATE) THEN EXTRACT(YEAR FROM app.APPLICATION_DATE) - EXTRACT(YEAR FROM psn_ins.BIRTHDATE)
+                        WHEN EXTRACT(MONTH FROM psn_ins.BIRTHDATE) > EXTRACT(MONTH FROM app.APPLICATION_DATE) THEN EXTRACT(YEAR FROM app.APPLICATION_DATE) - EXTRACT(YEAR FROM psn_ins.BIRTHDATE) -1
+                        WHEN EXTRACT(MONTH FROM psn_ins.BIRTHDATE) = EXTRACT(MONTH FROM app.APPLICATION_DATE) AND EXTRACT(DAY FROM psn_ins.BIRTHDATE) > EXTRACT(DAY FROM app.APPLICATION_DATE) THEN EXTRACT(YEAR FROM app.APPLICATION_DATE) - EXTRACT(YEAR FROM psn_ins.BIRTHDATE) -1
+                        ELSE EXTRACT(YEAR FROM app.APPLICATION_DATE) - EXTRACT(YEAR FROM psn_ins.BIRTHDATE)
+                    END
+                ELSE
+                    CASE
+                        WHEN psn_own.LASTNAME IS NULL OR psn_own.BIRTHDATE IS NULL THEN NULL
+                        WHEN EXTRACT(MONTH FROM psn_own.BIRTHDATE) < EXTRACT(MONTH FROM app.APPLICATION_DATE) THEN EXTRACT(YEAR FROM app.APPLICATION_DATE) - EXTRACT(YEAR FROM psn_own.BIRTHDATE)
+                        WHEN EXTRACT(MONTH FROM psn_own.BIRTHDATE) > EXTRACT(MONTH FROM app.APPLICATION_DATE) THEN EXTRACT(YEAR FROM app.APPLICATION_DATE) - EXTRACT(YEAR FROM psn_own.BIRTHDATE) -1
+                        WHEN EXTRACT(MONTH FROM psn_own.BIRTHDATE) = EXTRACT(MONTH FROM app.APPLICATION_DATE) AND EXTRACT(DAY FROM psn_own.BIRTHDATE) > EXTRACT(DAY FROM app.APPLICATION_DATE) THEN EXTRACT(YEAR FROM app.APPLICATION_DATE) - EXTRACT(YEAR FROM psn_own.BIRTHDATE) -1
+                        ELSE EXTRACT(YEAR FROM app.APPLICATION_DATE) - EXTRACT(YEAR FROM psn_own.BIRTHDATE)
+                    END
+            END OWN_AGE,
+            CASE 
+                WHEN OWNER_ID = INSURER_ID THEN
+                    addr_ins.KLADRSTREET
+                ELSE
+                    addr_own.KLADRSTREET
+            END OWN_REG_KLADR,
+            CASE 
+                WHEN OWNER_ID = INSURER_ID THEN
+                    insreg.reg_name
+                ELSE
+                    ownreg.reg_name
+            END OWN_REGION,
+        
+            VEH_TYPE_OSAGO, VEH_TYPE_GROUP, 
+            CAST(VEH_VIN AS VARCHAR2(100 CHAR)) VEH_VIN,
+            VEH_RUN, VEH_OWNER_COUNT,
+            CAST(VEH_BRAND AS VARCHAR2(100 CHAR)) VEH_BRAND,
+            VEH_BRAND_ID, VEH_CONSTRUCTION_YEAR, VEH_ENGINE_POWERHP, VEH_IS_TRAILER, VEH_KIND_NAME, 
+            CAST(VEH_PLATE_NUM AS VARCHAR2(100 CHAR)) VEH_PLATE_NUM, 
+            CAST(VEH_MODEL_NAME AS VARCHAR2(100 CHAR)) VEH_MODEL_NAME, 
+            VEH_MODEL_ID, 
+            CAST(VEH_CHASSIS_NUM AS VARCHAR2(100 CHAR)) VEH_CHASSIS_NUM,
+            CAST(VEH_BODY_NUM AS VARCHAR2(100 CHAR)) VEH_BODY_NUM,
+            VEH_PURPOSE, RTDM_RES_CODE, RTDM_RES_ERR_RSA, RTDM_RES_DECL_CAT, RTDM_RES_REINSURANCE_POOL, TRF_COEF_KT, TRF_COEF_KBM, TRF_COEF_KO, TRF_COEF_KVS, TRF_COEF_KM, TRF_COEF_KP, TRF_COEF_KS, TRF_FINAL_PREMIUM, TRF_TARIFF, TRF_COEF_TB_MAX, TRF_COEF_TB_MIN, TRF_MAX_PREMIUM, TRF_MIN_PREMIUM, RULE_ALL_RULES, RULE_ONE_RULE, RULE_MODEL_FLAG, RULE_STOP_OKVED_FLAG, RULE_MODEL_LOSS_FLAG, RULE_MODEL_UL_FRAUD_CUTOFF_FLAG, RULE_BLACKLISTS_FLAG, RULE_NON_TARGET_RULE, RULE_IS_TARGET_SEGMENT, CP_ASSIGN_RATIO_BOUND_PASS, CP_KANAL_PRODAZH_MAP, CP_SAVE_OFFER, CP_FILIAL, CP_STREAM, CP_LOTUS_DEPARTAMENT, CP_LOTUS_CHANNEL, CP_LIFE_HEALTH, CP_COURT, CP_UNDERWRITER_ACCEPT, CP_EXPECTED_LOSS, CP_EXPECTED_LOSS_RATIO, CP_FINAL_BRAND, CP_FINAL_MODEL, CP_FINAL_MODEL_GROUP, CP_STREAM_CHANGE, CP_FIX_RATE_REINSURANCE,
+                    CP_OKVED_OWNER,
+                    CP_OKVED_INSURER,
+            IS_SEGMENTATION, TRF_BASIC_TARIFF_CALC, LIB_CHISLENNOST_K, LIB_RASSTOYANIE_K, LIB_REGION_KLADR_K, LIB_REGION_PASPORT_K, LIB_STOLICA_K, LIB_TIP_TS_K, LIB_CEL_ISPOLZOVANIYA_K, LIB_DATE_DIF_K, LIB_VOZRAST_SOBSTVENNIKA_K, LIB_VOZRAST_TS_K, LIB_KOLVO_VODITELEJ_K, LIB_PASPORT_RF_K, LIB_STRAHOVATEL_SOBSTVENNIK_K, LIB_PRISEP_K, LIB_MARKA_K, LIB_KBM_K, LIB_FILIAL_KLADR_RASSTOYANIE_K, LIB_CHANNEL_K, LIB_OKVED_K, LIB_PARK_TS_K, LIB_MARRIED_K, LIB_PROLONGATION_K, LIB_LOGIN_COEF, LIB_PREV_INSURER_COEF, LIB_PROLONGATION_PERIOD_COEF, LIB_POWER_COEF, TRF_LOTUS_KT_COEF, TRF_INN_BASIC, TRF_K_EQUALIZER, KBM_CLASS,
+            CP_CITIZENSHIPCODE_CALC,
+            UPPER(rsa_svet.COLOR) SVETOFOR_RSA,
+            CASE WHEN autostat.RUN_ID IS NULL THEN 0 ELSE 1 END IS_AUTOSTAT_CALLED,
+            CP_PREMIUM_DCO, CP_TARIFFF_DCO, CP_KOEF_DCO, AGENT_BANK_OWNER, CP_BACKGROUND_MODEL_NAME, CP_EXPECTED_LOSS_RATIO_SEC, CP_EXPECTED_LOSS_SEC, CP_REPLY_RTDM_SEC, TRF_COEF_KN, TRF_COEF_KPR
+        FROM
+        (
+        SELECT
+                    app.RUN_ID,
+                    UPPER(app.CONTRACT_ID) CONTRACT_ID,
+                    app.CALLNUMBER CALL_NUMBER,
+                    app.CALCULATIONDATE CALCULATION_DATE,
+                    UPPER(CORRELATION_ID) CORRELATION_ID,
+                    UPPER(REQSOURCE_NAME) REQSOURCE_NAME,
+                    TRUNC(app.CONTRACTDATE) CONTRACT_DATE,        
+                    TRUNC(app.CONTRACTSTARTDATE) CONTRACT_START_DATE,
+                    TRUNC(app.CONTRACTENDDATE) CONTRACT_END_DATE,
+                    TRUNC(app.APPLICATIONDATE) APPLICATION_DATE,
+                    TRIM(REPLACE(REGEXP_REPLACE(REGEXP_REPLACE(app.SYSCREATEUSER, '[«»]', '"'), '[^a-zA-Zа-яА-ЯёЁ0-9 .()"-]'), '  ', ' ')) SYS_CREATE_USER,
+                    app.SALECHANNEL SALE_CHANNEL_ID,
+                    DECODE(app.SALECHANNEL, 0, 'PARTAPI', dchnl.NAME) SALE_CHANNEL_NAME, 
+                    TRIM(REGEXP_REPLACE(REGEXP_REPLACE(app.BRANCHSKK_NAME, '[«»]', '"'), '[^a-zA-Zа-яА-ЯёЁ0-9 .()"-]')) BRANCHSKK_NAME,
+                    TRIM(INITCAP(app.FILIAL_NAME)) FILIAL_NAME,
+                    fil_div.DIVISION_NAME FILIAL_DIVISION_NAME,
+                    UPPER(app.PARTNER_CODE) PARTNER_CODE,
+        
+                    agn.AGENT_NUMBER AGENT_DOC_NUMBER,
+                    TRIM(REGEXP_REPLACE(REPLACE(agn.NAME, '  ', ' '), '[«»]', '"')) AGENT_NAME,
+                    agng.GROUPE AGENT_GROUP, 
+        
+                    TRIM(REGEXP_REPLACE(REGEXP_REPLACE(app.DIVISION_NAME, '[«»]', '"'), '[^a-zA-Zа-яА-ЯёЁ0-9 .()"-]')) DIVISION_NAME,
+                    
+                    REGEXP_REPLACE(LOWER(app.LOGIN), '[^a-z0-9_-]') LOGIN,
+                    app.GOV_IS_CONTRACT IS_GOVERMENT_CONTRACT,
+                    app.ISTERMINATION IS_TERMINATION,
+                    app.ISAGREEMENT IS_AGREEMENT,
+                    app.ISINTEGRATION IS_INTEGRATION,
+                    app.ISPROLONGATION IS_PROLONGATION,
+                    CASE WHEN REGEXP_REPLACE(app.PREVIOUSCONTRACTSERIAL, '[^a-zA-Zа-яА-ЯёЁ0-9]') = '' THEN NULL ELSE REGEXP_REPLACE(app.PREVIOUSCONTRACTSERIAL, '[^a-zA-Zа-яА-ЯёЁ0-9]') END PREV_POLICY_SERIAL,
+                    CASE WHEN REGEXP_REPLACE(app.PREVIOUSCONTRACTNUMBER, '[^a-zA-Zа-яА-ЯёЁ0-9]') = '' THEN NULL ELSE REGEXP_REPLACE(app.PREVIOUSCONTRACTNUMBER, '[^a-zA-Zа-яА-ЯёЁ0-9]') END PREV_POLICY_NUMBER,
+                    TRIM(REGEXP_REPLACE(app.IPADDRESS,'[^0-9], ')) IP_ADDRESS,
+                    app.ISLOSTPOLICY IS_LOST_POLICY,
+                    DECODE(UPPER(app.CHECK_TCUW), 'FALSE', 0, 'TRUE', 1, NULL) IS_CHECK_TCUW,
+        
+                    DECODE(UPPER(app.OWNER),'00000000-0000-0000-0000-000000000000', NULL, '000', NULL, UPPER(app.OWNER)) OWNER_ID,
+                    DECODE(UPPER(app.INSURER_ID),'00000000-0000-0000-0000-000000000000', NULL, '000', NULL, UPPER(app.INSURER_ID)) INSURER_ID,
+        
+                    vt.VEHICLE_TYPE VEH_TYPE_OSAGO,
+                    vt.ID_MODEL VEH_TYPE_GROUP,
+                    REGEXP_REPLACE(UPPER(veh.VIN), '[^A-Z0-9]') VEH_VIN,
+                    veh.RUN VEH_RUN,
+                    veh.OWNERCOUNT VEH_OWNER_COUNT,
+                    UPPER(veh.BRAND_NAME) VEH_BRAND,
+                    REPLACE(UPPER(veh.BRAND_ID), 'RDM!', '') VEH_BRAND_ID,
+                    TO_NUMBER(veh.CONSTRUCTIONDATE) VEH_CONSTRUCTION_YEAR,
+                    TRUNC(veh.ENGINEPOWERHP) VEH_ENGINE_POWERHP,
+                    veh.ISTRAILER VEH_IS_TRAILER,
+                    UPPER(veh.VEHICLE_KIND_NAME) VEH_KIND_NAME,
+                    REGEXP_REPLACE(UPPER(veh.LICENCEPLATE), '[^A-ZА-ЯЁ0-9]') VEH_PLATE_NUM,
+                    TRIM(UPPER(veh.MODEL_NAME)) VEH_MODEL_NAME,
+                    REPLACE(UPPER(veh.MODEL_ID), 'RDM!', '') VEH_MODEL_ID,
+                    REGEXP_REPLACE(DECODE(UPPER(TRIM(veh.CHASSIS_NUMBER)), 'Б/Н', NULL, '', NULL, 'ОТСУТСТВУЕТ', NULL,  UPPER(TRIM(veh.CHASSIS_NUMBER))), '[^A-ZА-ЯЁ0-9]') VEH_CHASSIS_NUM,
+                    REGEXP_REPLACE(DECODE(UPPER(TRIM(veh.BODY_NUMBER)), 'Б/Н', NULL, '', NULL, 'ОТСУТСТВУЕТ', NULL,  UPPER(TRIM(veh.BODY_NUMBER))), '[^A-ZА-ЯЁ0-9]') VEH_BODY_NUM,
+                    vup.NAME VEH_PURPOSE,
+        
+                    rr.RESULT_CODE RTDM_RES_CODE, 
+                    CASE rr.RTDM_RESULT WHEN 'Сервис РСА.КБМ не доступен' THEN 1 ELSE 0 END RTDM_RES_ERR_RSA,
+                    NULLIF(TRIM(REPLACE(REPLACE(REPLACE(REPLACE(DECLINE_CATEGORY,
+                                                    'Дальнейшее оформление невозможно. Код:', ''
+                                                    ),
+                                            'Укажите номер предыдущего договора. Это позволит получить более выгодные условия оформления и тарифа', ''
+                                            ),
+                                    'В случае оформления договора на основании введённых данных договор может быть расторгнут',''
+                                    ),
+                            'Успешно',''
+                            )
+                    ),'') RTDM_RES_DECL_CAT, 
+                    rr.REINSURANCE_POOL RTDM_RES_REINSURANCE_POOL,
+        
+                    cr.KT TRF_COEF_KT, 
+                    cr.KBM TRF_COEF_KBM, 
+                    cr.KO TRF_COEF_KO, 
+                    cr.KVS TRF_COEF_KVS, 
+                    cr.KM TRF_COEF_KM, 
+                    cr.KP TRF_COEF_KP, 
+                    cr.KS TRF_COEF_KS, 
+                    cr.PREMIUM TRF_FINAL_PREMIUM,
+                    cr.tariff TRF_TARIFF,
+                    cr.KN TRF_COEF_KN,
+                    cr.KPR TRF_COEF_KPR,
+        
+                    trf.TB_MAX TRF_COEF_TB_MAX,
+                    trf.TB_MIN TRF_COEF_TB_MIN,
+                    ROUND(trf.TB_MAX*cr.KT*cr.KBM*cr.KO*cr.KVS*cr.KM*cr.KP*cr.KS, 2) TRF_MAX_PREMIUM,
+                    ROUND(trf.TB_MIN*cr.KT*cr.KBM*cr.KO*cr.KVS*cr.KM*cr.KP*cr.KS, 2) TRF_MIN_PREMIUM,
+        
+                    -- правила RULES
+                    rl.ALL_RULES RULE_ALL_RULES,
+                    CASE WHEN rl.ONE_RULE IS NULL THEN rl.ALL_RULES ELSE rl.ONE_RULE END RULE_ONE_RULE,
+                    rl.RULE_MODEL_FLAG RULE_MODEL_FLAG,
+                    rl.RULE_STOP_OKVED_FLAG RULE_STOP_OKVED_FLAG,
+                    rl.RULE_MODEL_LOSS_FLAG RULE_MODEL_LOSS_FLAG,
+                    rl.RULE_MODEL_UL_FRAUD_CUTOFF_FLAG RULE_MODEL_UL_FRAUD_CUTOFF_FLAG,
+                    rl.RULE_BLACKLISTS_FLAG RULE_BLACKLISTS_FLAG,
+                    rl.RULE_NON_TARGET_RULE,          
+                    rl.RULE_IS_TARGET_SEGMENT,
+        
+                    -- calc parameters
+                    cp.ASSIGN_RATIO_BOUND_PASS CP_ASSIGN_RATIO_BOUND_PASS,
+                    cp.KANAL_PRODAZH_MAP CP_KANAL_PRODAZH_MAP,
+                    cp.SAVE_OFFER CP_SAVE_OFFER,
+                    cp.FILIAL CP_FILIAL,
+                    UPPER(cp.STREAM) CP_STREAM,
+                    REGEXP_REPLACE(cp.LOTUS_DEPARTAMENT, '[^a-zA-Zа-яА-ЯёЁ0-9 .()"-]') CP_LOTUS_DEPARTAMENT,
+                    REGEXP_REPLACE(cp.LOTUS_CHANNEL, '[^a-zA-Zа-яА-ЯёЁ0-9 .()"-]') CP_LOTUS_CHANNEL,
+                    cp.LIFE_HEALTH CP_LIFE_HEALTH,
+                    cp.COURT CP_COURT,
+                    UPPER(cp.UNDERWRITER_ACCEPT) CP_UNDERWRITER_ACCEPT,
+                    cp.EXPECTED_LOSS CP_EXPECTED_LOSS,
+                    cp.EXPECTED_LOSS_RATIO CP_EXPECTED_LOSS_RATIO,
+                    UPPER(cp.FINAL_BRAND) CP_FINAL_BRAND,
+                    UPPER(cp.FINAL_MODEL) CP_FINAL_MODEL,
+                    UPPER(cp.FINAL_MODEL_GROUP) CP_FINAL_MODEL_GROUP,
+                    cp.STREAM_CHANGE CP_STREAM_CHANGE,
+                    cp.OKVED_OWNER CP_OKVED_OWNER,
+                    cp.OKVED_INSURER CP_OKVED_INSURER,
+                    cp.FIX_RATE_REINSURANCE CP_FIX_RATE_REINSURANCE,
+        
+                    ls.SEGMENTATION_RULE IS_SEGMENTATION
+        
+                    -- таррификация
+                    ,trf.BASE_TARIFF as TRF_BASIC_TARIFF_CALC
+                    ,trf.chislennost_coeff LIB_chislennost_K
+                    ,trf.rasstoyanie_coeff LIB_rasstoyanie_K
+                    ,trf.region_kladr_coeff LIB_region_kladr_K
+                    ,trf.region_pasport_coeff LIB_region_pasport_K
+                    ,trf.stolica_coeff LIB_stolica_K
+                    ,trf.tip_ts_coeff LIB_tip_ts_K
+                    ,trf.cel_ispolzovaniya_coeff LIB_cel_ispolzovaniya_K
+                    ,trf.date_dif_coeff LIB_date_dif_K
+                    ,trf.vozrast_sobstvennika_coeff LIB_vozrast_sobstvennika_K
+                    ,trf.vozrast_ts_coeff LIB_vozrast_ts_K
+                    ,trf.kolvo_voditelej_coeff LIB_kolvo_voditelej_K
+                    ,trf.pasport_rf_coeff LIB_pasport_rf_K
+                    ,trf.strahovatel_sobstvennik_coeff LIB_strahovatel_sobstvennik_K
+                    ,trf.prisep_coeff LIB_prisep_K
+                    ,trf.marka_coeff LIB_marka_K
+                    ,trf.kbm_coeff LIB_kbm_K
+                    ,trf.filial_kladr_rasstoyanie_coeff LIB_filial_kladr_rasstoyanie_K
+                    ,trf.channel_coeff LIB_channel_K
+                    ,trf.okved_coeff LIB_okved_K
+                    ,trf.park_ts_coeff LIB_park_ts_K
+                    ,trf.married_coeff LIB_married_K
+                    ,trf.prolongation_coeff LIB_prolongation_K
+                    ,trf.login_coef LIB_login_coef
+                    ,trf.prev_insurer_coef LIB_prev_insurer_coef
+                    ,trf.prolongation_period_coef LIB_prolongation_period_coef
+                    ,trf.power_coef LIB_power_coef
+                    ,trf.LOTUS_KT_COEF TRF_LOTUS_KT_COEF
+                    ,trf.inn_basic TRF_inn_basic
+                    ,trf.K_EQUALIZER TRF_K_EQUALIZER 
+                    --,kbmc.KBM_CLASS 
+                    ,CASE
+                        WHEN kbmc.KBM_COEFF_NEXT IS NULL THEN kbmc.KBM_CLASS
+                        WHEN cr.KBM = kbmc.KBM_COEFF THEN kbmc.KBM_CLASS
+                        WHEN cr.KBM - kbmc.KBM_COEFF >= kbmc.KBM_COEFF_next - cr.KBM THEN kbmc.KBM_CLASS_next
+                        WHEN cr.KBM - kbmc.KBM_COEFF < kbmc.KBM_COEFF_next - cr.KBM THEN kbmc.KBM_CLASS
+                        ELSE NULL
+                    END KBM_CLASS     
+                    ,cp_tc.text CP_CITIZENSHIPCODE_CALC
+                    ,cp.PREMIUM_DCO CP_PREMIUM_DCO, cp.TARIFFF_DCO CP_TARIFFF_DCO, cp.KOEF_DCO CP_KOEF_DCO, TRIM(REGEXP_REPLACE(REPLACE(agn.OWNER_NAME, '  ', ' '), '[«»]', '"')) AGENT_BANK_OWNER, cp.BACKGROUND_MODEL_NAME CP_BACKGROUND_MODEL_NAME, cp.EXPECTED_LOSS_RATIO_SEC CP_EXPECTED_LOSS_RATIO_SEC, cp.EXPECTED_LOSS_SEC CP_EXPECTED_LOSS_SEC, cp.REPLY_RTDM_SEC CP_REPLY_RTDM_SEC
+    
+                    
+                    FROM
+                        CUBE_OSAGO_UL_APP app
+                        LEFT JOIN
+                        CUBE_OSAGO_UL_VEH veh ON veh.RUN_ID = app.RUN_ID
+                        LEFT JOIN
+                        CUBE_RTDM_DICT_VT vt ON UPPER(vt.VEHICLE_ID_WA)  = UPPER(veh.VEHICLETYPEOSAGO) 
+                        LEFT JOIN
+                        CUBE_DICT_USAGEPURPOSE vup ON vup.RTDM_ID = UPPER(veh.VEHICLEUSAGEPURPOSE)
+                        LEFT JOIN
+                        CUBE_OSAGO_UL_RES rr ON rr.RUN_ID = app.RUN_ID
+                        LEFT JOIN
+                        CUBE_OSAGO_UL_CR cr ON cr.RUN_ID = app.RUN_ID
+                        LEFT JOIN
+                        CUBE_OSAGO_UL_TF trf ON trf.RUN_ID = app.RUN_ID
+                        LEFT JOIN
+                        CUBE_OSAGO_UL_RULE_TMP rl ON rl.run_id = app.run_id 
+                        LEFT JOIN
+                        CUBE_OSAGO_UL_LS ls ON ls.RUN_ID = app.RUN_ID 
+                        LEFT JOIN
+                        --CUBE_DICT_KBM kbmc ON cr.KBM = kbmc.KBM_COEFF and kbmc.date_end = date '2900-01-01' 
+                        (
+                          SELECT
+                            kbmc.KBM_CLASS, LEAD(kbmc.KBM_CLASS) OVER (ORDER BY kbmc.KBM_COEFF asc) KBM_CLASS_Next,
+                            kbmc.KBM_COEFF, LEAD(kbmc.KBM_COEFF) OVER (ORDER BY kbmc.KBM_COEFF asc) KBM_COEFF_next
+                          from 
+                            CUBE_DICT_KBM kbmc
+                          where
+                            kbmc.date_end = date '2900-01-01'
+                        ) kbmc ON cr.KBM >= kbmc.KBM_COEFF AND (cr.KBM < kbmc.KBM_COEFF_NEXT OR kbmc.KBM_COEFF_NEXT IS NULL)
+                        LEFT JOIN
+                        CUBE_OSAGO_UL_CP_TMP cp on cp.RUN_ID = app.RUN_ID 
+                        LEFT JOIN
+                        CUBE_OSAGO_UL_DICT_CHNL dchnl ON dchnl.ID = app.SALECHANNEL 
+                        LEFT JOIN
+                        CUBE_OSAGO_DICT_FILIAL_DIV fil_div ON fil_div.FILIAL_NAME = UPPER(app.FILIAL_NAME) 
+--                        LEFT JOIN
+--                        CUBE_OSAGO_UL_AGN agn ON agn.RUN_ID = app.RUN_ID 
+--                        LEFT JOIN
+--                        CUBE_OSAGO_UL_DICT_AGN agng ON agng.AGENT_NAME = TRIM(REPLACE(UPPER(agn.NAME), '  ', ' '))
+                        LEFT JOIN
+                        CUBE_OSAGO_UL_CP_TC cp_tc on cp_tc.run_id=app.run_id and cp_tc.NAME='CITIZENSHIPCODE_CALC'
+                        LEFT JOIN
+                        (
+                            SELECT agn.RUN_ID, agn.NAME, agn.AGENT_NUMBER, NUM, OWNER_NAME
+                            FROM CUBE_OSAGO_UL_AGN agn LEFT JOIN 
+                            (
+                            SELECT
+                                        cntr.NUM, cntr.OWNER_NAME
+                                    FROM
+                                    (
+                                        SELECT 
+                                            NUM, 
+                                            TRIM(UPPER(SUBSTR(CONTRACT_TEXT, INSTR(CONTRACT_TEXT, '<REPRNAME>')+LENGTH('<REPRNAME>'), INSTR(CONTRACT_TEXT, '</REPRNAME>') - INSTR(CONTRACT_TEXT, '<REPRNAME>')-LENGTH('<REPRNAME>')))) agent_name,
+                                            TRIM(UPPER(SUBSTR(BANK_TEXT, INSTR(BANK_TEXT, '<OWNERNAME>')+LENGTH('<OWNERNAME>'), INSTR(BANK_TEXT, '</OWNERNAME>') - INSTR(BANK_TEXT, '<OWNERNAME>')-LENGTH('<OWNERNAME>')))) owner_name
+                                        FROM 
+                                            ETL_LOTUS_AG_CONTR
+                                    ) cntr LEFT JOIN
+                                    (
+                                        SELECT
+                                            NUM
+                                        FROM 
+                                        (
+                                            SELECT
+                                                NUM, OWNER_NAME
+                                            FROM
+                                            (
+                                                SELECT 
+                                                    NUM, 
+                                                    TRIM(UPPER(SUBSTR(CONTRACT_TEXT, INSTR(CONTRACT_TEXT, '<REPRNAME>')+LENGTH('<REPRNAME>'), INSTR(CONTRACT_TEXT, '</REPRNAME>') - INSTR(CONTRACT_TEXT, '<REPRNAME>')-LENGTH('<REPRNAME>')))) agent_name,
+                                                    TRIM(UPPER(SUBSTR(BANK_TEXT, INSTR(BANK_TEXT, '<OWNERNAME>')+LENGTH('<OWNERNAME>'), INSTR(BANK_TEXT, '</OWNERNAME>') - INSTR(BANK_TEXT, '<OWNERNAME>')-LENGTH('<OWNERNAME>')))) owner_name
+                                                FROM 
+                                                    ETL_LOTUS_AG_CONTR
+                                            )
+                                            GROUP BY 
+                                                NUM, OWNER_NAME
+                                        )
+                                        GROUP BY 
+                                            NUM
+                                        HAVING COUNT(*) > 1
+                                    ) cntrunq ON cntrunq.num = cntr.num
+                                    WHERE
+                                            cntrunq.NUM IS NULL
+                                    GROUP BY
+                                        cntr.NUM, cntr.OWNER_NAME
+                            )ht ON agn.AGENT_NUMBER = ht.NUM
+                            ) agn ON agn.RUN_ID = app.RUN_ID 
+                            LEFT JOIN
+                        CUBE_OSAGO_UL_DICT_AGN agng ON agng.AGENT_NAME = TRIM(REPLACE(UPPER(agn.NAME), '  ', ' '))
+        
+                    WHERE 
+                        app.PRODUCTCODE = 'ОСАГО ЮЛ'
+                        AND
+                        app.RUN_ID BETWEEN v_from_run_id AND v_till_run_id
+                        AND
+                        UPPER(app.CORRELATION_ID) != 'TEST_RTDM'
+                        AND
+                        UPPER(app.CORRELATION_ID) != 'NIKITA'   
+                        AND
+                        app.CALLNUMBER < 7 
+                        AND
+                        UPPER(app.LOGIN) NOT IN ('RPALANDAU','FVFUMMO100')
+                        /*AND
+                        --(app.RUN_ID NOT IN (21506980,22067729,21792141,21794598,22066679,21793676))
+                        app.RUN_ID NOT IN (23472935,
+                                            23274876,
+                                            22962216,
+                                            23031067,
+                                            23537721,
+                                            22904077,
+                                            23144474,
+                                            23145215,
+                                            23400605,
+                                            23213146,
+                                            22840461,
+                                            22637240,
+                                            23146156,
+                                            23471450,
+                                            23146856,
+                                            23583062,
+                                            22963816,
+                                            22965423,
+                                            23339230,
+                                            22705491,
+                                            23096332,
+                                            23147731) */
+        ) app        
+        -- INSURER
+        LEFT JOIN
+        CUBE_OSAGO_UL_PSN psn_ins ON psn_ins.RUN_ID = app.RUN_ID AND UPPER(psn_ins.SUBJECT_ID) = app.INSURER_ID AND UPPER(psn_ins.TYPE) = 'СТРАХОВАТЕЛЬ' 
+        LEFT JOIN
+        CUBE_OSAGO_UL_AHNTR_INN ahntrinn_ins ON ahntrinn_ins.RUN_ID = app.RUN_ID AND UPPER(ahntrinn_ins.SUBJECT_ID) = app.INSURER_ID
+        LEFT JOIN
+        CUBE_OSAGO_UL_ADDR addr_ins ON addr_ins.RUN_ID = app.RUN_ID AND 
+                                        UPPER(addr_ins.SUBJECT_ID) = app.INSURER_ID AND 
+                                        UPPER(addr_ins.SUBJECT_TYPE) = 'СТРАХОВАТЕЛЬ' AND
+                                        addr_ins.KLADRSTREET IS NOT NULL AND
+                                        UPPER(COALESCE(CAST(addr_ins.ADDRESS_TYPE AS VARCHAR2(40)), 'REGISTRATION')) IN ( UPPER('549d34fa-8470-409d-9aa7-7486baee77ac'), 'REGISTRATION')
+        LEFT JOIN
+        CUBE_DICT_KLADR_REGION insreg ON insreg.kladr = SUBSTR(addr_ins.KLADRSTREET, 1, 2)
+        
+        -- OWNER
+        LEFT JOIN
+        CUBE_OSAGO_UL_PSN psn_own ON psn_own.RUN_ID = app.RUN_ID AND UPPER(psn_own.SUBJECT_ID) = app.OWNER_ID AND UPPER(psn_own.TYPE) = 'СОБСТВЕННИК' 
+        LEFT JOIN
+        CUBE_OSAGO_UL_AHNTR_INN ahntrinn_own ON ahntrinn_own.RUN_ID = app.RUN_ID AND UPPER(ahntrinn_own.SUBJECT_ID) = app.OWNER_ID
+        LEFT JOIN
+        CUBE_OSAGO_UL_ADDR addr_own ON addr_own.RUN_ID = app.RUN_ID AND 
+                                        UPPER(addr_own.SUBJECT_ID) = app.OWNER_ID AND 
+                                        UPPER(addr_own.SUBJECT_TYPE) = 'СОБСТВЕННИК' AND
+                                        addr_own.KLADRSTREET IS NOT NULL AND
+                                        UPPER(COALESCE(CAST(addr_own.ADDRESS_TYPE AS VARCHAR2(40)), 'REGISTRATION')) IN ( UPPER('549d34fa-8470-409d-9aa7-7486baee77ac'), 'REGISTRATION')
+        LEFT JOIN
+        CUBE_DICT_KLADR_REGION ownreg ON ownreg.kladr = SUBSTR(addr_own.KLADRSTREET, 1, 2)
+        LEFT JOIN (
+            SELECT AGENT_DOCUMENT_NO, AGENT_LOGIN, HOLDING_NAME FROM
+            (
+                SELECT grtbl.AGENT_DOCUMENT_NO, grtbl.AGENT_LOGIN, grtbl.HOLDING_NAME, etl_holding_agent.HOLDING_AGENT_BEGIN_DATE, etl_holding_agent.HOLDING_AGENT_END_DATE, 
+                ROW_NUMBER() OVER(PARTITION BY grtbl.AGENT_LOGIN ORDER BY etl_holding_agent.HOLDING_AGENT_END_DATE DESC, etl_holding_agent.HOLDING_AGENT_BEGIN_DATE DESC) rtd
+                FROM (
+                        SELECT etl_holding_login.AGENT_DOCUMENT_NO, REGEXP_REPLACE(LOWER(etl_holding_login.AGENT_LOGIN), '[^a-z0-9]') AGENT_LOGIN, etl_holding_login.HOLDING_NAME 
+                        FROM etl_holding_login 
+                        WHERE etl_holding_login.AGENT_LOGIN is not null 
+                        GROUP BY etl_holding_login.AGENT_DOCUMENT_NO, etl_holding_login.AGENT_LOGIN, etl_holding_login.HOLDING_NAME) grtbl
+                INNER JOIN etl_holding_agent ON grtbl.AGENT_DOCUMENT_NO = etl_holding_agent.agent_document_no AND grtbl.HOLDING_NAME = etl_holding_agent.HOLDING_NAME
+            )
+            WHERE rtd = 1
+        ) lb ON AGENT_DOC_NUMBER = lb.AGENT_DOCUMENT_NO AND LOGIN = lb.AGENT_LOGIN
+        LEFT JOIN (
+        SELECT ht.AGENT_DOCUMENT_NO, ht.HOLDING_NAME
+        FROM (
+            SELECT AGENT_DOCUMENT_NO, HOLDING_NAME, HOLDING_AGENT_BEGIN_DATE, HOLDING_AGENT_END_DATE, 
+            ROW_NUMBER() OVER(PARTITION BY AGENT_DOCUMENT_NO ORDER BY HOLDING_AGENT_BEGIN_DATE DESC, HOLDING_AGENT_END_DATE DESC) rn_date
+            FROM etl_holding_agent
+        ) ht
+        WHERE ht.rn_date = 1 
+    ) a_holding ON AGENT_DOC_NUMBER = a_holding.AGENT_DOCUMENT_NO
+--        LEFT JOIN
+--        CUBE_DICT_HOLDING haid ON haid.id = CAST(STANDARD_HASH(REGEXP_REPLACE(UPPER(AGENT_DOC_NUMBER), '[^A-ZА-ЯЁ0-9]'), 'MD5') AS VARCHAR2(36)) AND haid.ENTITY_TYPE = 'AGENT_ID'
+--        LEFT JOIN
+--        CUBE_DICT_HOLDING han ON han.id = CAST(STANDARD_HASH(REGEXP_REPLACE(UPPER(AGENT_NAME), '[^A-ZА-ЯЁ0-9]'), 'MD5') AS VARCHAR2(36)) AND han.ENTITY_TYPE = 'AGENT_NAME'
+--        LEFT JOIN
+--        CUBE_DICT_HOLDING had ON had.id = CAST(STANDARD_HASH(REGEXP_REPLACE(UPPER(DIVISION_NAME), '[^A-ZА-ЯЁ0-9]'), 'MD5') AS VARCHAR2(36))  AND had.ENTITY_TYPE = 'DIVISION_NAME'
+--        LEFT JOIN
+--        CUBE_DICT_HOLDING hal ON hal.id = CAST(STANDARD_HASH(REGEXP_REPLACE(UPPER(LOGIN), '[^A-ZА-ЯЁ0-9]'), 'MD5') AS VARCHAR2(36))  AND hal.ENTITY_TYPE = 'LOGIN'
+        LEFT JOIN
+        ETL_OSAGO_RSA_SVETOFOR rsa_svet ON rsa_svet.KLADR = DECODE( UPPER(app.OWNER_ID),
+                                                                UPPER(psn_own.SUBJECT_ID), 
+                                                                SUBSTR(addr_own.KLADRSTREET, 1,2),
+                                                                UPPER(psn_ins.SUBJECT_ID), 
+                                                                SUBSTR(addr_ins.KLADRSTREET,1,2)
+                                                                )
+        LEFT JOIN
+        (SELECT RUN_ID FROM CUBE_OSAGO_UL_AUTOSTAT WHERE VIN IS NOT NULL GROUP BY RUN_ID) autostat ON autostat.RUN_ID = app.RUN_ID
+        ) app;
+
+
+                
+        COMMIT;
+                    
+        v_rec_count := SQL%ROWCOUNT;
+
+        BEGIN
+            EXECUTE IMMEDIATE 'ALTER TABLE CUBE_OSAGO_UL_INS_TMP ADD CONSTRAINT CUBE_OSAGO_UL_INS_TMP_PK' || TO_CHAR(p_prod_id) || ' PRIMARY KEY("RUN_ID")';
+        EXCEPTION
+            WHEN OTHERS THEN
+                p_res := 10;
+                p_msg := p_msg || 'Ошибка создания уникального ключа';
+        END;
+
+        IF p_res != 0 THEN
+            RETURN;
+        END IF;
+        
+     
+        BEGIN
+            EXECUTE IMMEDIATE 'INSERT ALL INTO CUBE_OSAGO_UL_INS SELECT * FROM CUBE_OSAGO_UL_INS_TMP';
+        EXCEPTION
+            WHEN OTHERS THEN
+                IF SQLCODE != -942 THEN
+                    RAISE;
+                END IF;
+        END;
+
+        COMMIT;
+        
+        p_msg := p_msg || 'Обработано ' || TO_CHAR(v_rec_count) || ' записей. Время выполнения: ' || TO_CHAR(TRUNC((SYSDATE - v_now)*24*60*60)) || ' секунд';
+        RETURN;
+    END sp_osago_ul_collect_by_prod;       
+        
+    
+    PROCEDURE sp_osago_ul_execute(p_log IN integer DEFAULT 0)
+    IS
+        v_msg varchar2(4000 char); 
+        v_res integer;
+
+        v_rdy_prod_count integer;
+        v_need_prod_count integer;
+        v_prod_id integer;
+
+        v_start_date date;
+        v_from_date date;
+        v_till_date date;
+        v_procedure_name varchar2(100 char); 
+        
+    BEGIN
+        v_res := 0;
+        v_msg := 'Обновление завершено корректно';
+        v_start_date := SYSDATE;
+        v_procedure_name := UPPER('CUBE_PROCESSING.SP_OSAGO_UL_EXECUTE'); -- имя текущей процедуры
+        
+        IF p_log = 1 THEN
+            INSERT INTO DATACOLLECTION_LOG( START_DATE, PROCEDURE_NAME) VALUES(v_start_date, 'cube_processing.sp_osago_ul_execute');
+            COMMIT;
+        END IF;
+        
+
+        -- проверка готовности реплики
+        SELECT 
+           COUNT(*) INTO v_rdy_prod_count           
+        FROM 
+            SYS_UTILS.ETL_TALEND_JOB_STATUS js INNER JOIN
+            DATACOLLECTION_SETTINGS dls ON 
+                                            dls.PROCEDURE_NAME = 'CUBE_PROCESSING.SP_OSAGO_UL_EXECUTE' AND 
+                                            dls.VALUE_TYPE = 'PROD_ID' AND
+                                            DECODE(dls.VALUE_N, 1, 'RTDM_PROD_1_MAIN', 2, 'RTDM_PROD_2_MAIN', 3, 'RTDM_PROD_3_MAIN', 4, 'RTDM_PROD_4_MAIN', 5, 'RTDM_PROD_5_MAIN', 8, 'RTDM_PROD_8_MAIN') = js.JOB_NAME
+        WHERE 
+            STATUS_ID = 3 AND 
+            COMPLETE_DATE = TRUNC(SYSDATE);
+        
+        SELECT 
+            COUNT(*) INTO v_need_prod_count 
+        FROM
+            DATACOLLECTION_SETTINGS dls 
+        WHERE
+            dls.PROCEDURE_NAME = v_procedure_name AND
+            dls.VALUE_TYPE = 'PROD_ID';
+        
+         --dbms_output.put_line('Начало процедуры сборки куба'); 
+        v_res := 0;
+        sp_osago_ul_prepare(v_res, v_msg);
+    
+        v_from_date := TRUNC(SYSDATE)-2;
+        v_till_date := TRUNC(SYSDATE);        
+       
+       
+        DECLARE CURSOR cur_prod IS SELECT VALUE_N FROM DATACOLLECTION_SETTINGS dls WHERE dls.PROCEDURE_NAME = v_procedure_name AND dls.VALUE_TYPE = 'PROD_ID';
+        BEGIN
+            FOR ds_item IN cur_prod LOOP
+                dbms_output.put_line(ds_item.value_n); 
+                --if ds_item.value_n = 4 then
+                    sp_osago_ul_collect_by_prod(v_res, v_msg, ds_item.value_n, v_from_date, v_till_date);
+                --end if;
+                COMMIT;
+                IF p_log = 0 THEN       
+                    dbms_output.put_line(v_msg); 
+                END IF;
+            END LOOP;
+        END;
+
+        IF p_log = 1 AND v_res != 0 THEN
+                UPDATE DATACOLLECTION_LOG
+                SET
+                    END_DATE = SYSDATE,
+                    RESULT_NUM = v_res,
+                    RESULT_TEXT = v_msg
+                WHERE PROCEDURE_NAME = v_procedure_name AND START_DATE = v_start_date;
+                COMMIT;
+        END IF;
+       
+        sp_osago_ul_update(v_res, v_msg);
+        IF v_res = 0 THEN
+            v_msg := 'Обновление завершено корректно';
+        END IF;
+        
+        IF p_log = 1 THEN
+                UPDATE DATACOLLECTION_LOG
+                SET
+                    END_DATE = SYSDATE,
+                    RESULT_NUM = v_res,
+                    RESULT_TEXT = v_msg
+                WHERE PROCEDURE_NAME = v_procedure_name AND START_DATE = v_start_date;
+                COMMIT;
+        END IF;
+       
+        COMMIT;
+        
+    END sp_osago_ul_execute;
+
+
+END CUBE_OSAGO_UL_PROCESSING;
